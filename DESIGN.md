@@ -157,11 +157,18 @@ State fields:
 - `updatedAt`: last state update timestamp.
 - `lastChangeSummary`: latest checkpoint change summary.
 
-On session start/resume, restore the latest state entry from the current branch.
+On session start/resume and on tree navigation (`session_tree`), restore the latest state entry from the current branch.
 
 ### Prompt Injection
 
-When active, `before_agent_start` appends grill instructions to the system prompt:
+Prompt injection must not break provider prompt caching. Caches match an exact prefix, and the system prompt leads every request, so per-turn data in it would force the whole conversation to be reprocessed on every answer. `before_agent_start` therefore splits injection in two:
+
+- **Static rules** go into `systemPromptOptions.sections.grill_me`. The text is identical for every turn of an active session (all phase and research-mode rules are included; the current values come from state messages), so the prompt prefix stays stable. The section is removed when the session ends. On pi versions without `systemPromptOptions`, the same static text is appended via `systemPrompt`.
+- **Dynamic state** (topic, configuration, phase, active output selection, approved output plan, checkpoint, Tab alternatives) is returned as a hidden `grill-me-context` custom message, which pi appends after the user's message and persists, leaving the cached prefix untouched.
+
+To avoid re-sending large checkpoints, the extension tracks what the model already knows. Fields changed by the model's own `grill_*` tool calls are marked known; only fields changed elsewhere (for example `/grill intent`, `/grill research`, `/grill output`, `/checkpoint edit`) are sent. The full state is sent at session start, on resume, and after compaction (`session_compact`). When a user stops the session with `/grill stop`, one short "session ended" message is sent.
+
+The static rules instruct the assistant to:
 
 - apply Socratic method,
 - use one thorough default style,
@@ -181,6 +188,8 @@ When active, `before_agent_start` appends grill instructions to the system promp
 - if the user continues grilling or stops without output, call `grill_finish_output_selection_phase`.
 
 ### Tools
+
+The `grill_*` tools are registered with `defaultActive: false`. They are added to the active tool set when a session starts (or is restored on resume/branch navigation) and removed when it ends, so sessions outside Grill Me don't pay for their schemas in every request.
 
 #### `grill_set_alternatives`
 
@@ -271,9 +280,12 @@ Behavior:
 While `active && !outputPhase`:
 
 - block `edit` and `write`,
-- block bash commands that appear mutating,
+- block `bash` and `powershell` commands that are not on a conservative read-only allowlist. Command/process substitution, output redirection (except to `/dev/null`), `tee`, unknown commands, env-var prefixes, mutating flags (`sed -i`, `find -delete`, `sort -o`, ...), mutating `git`/`gh`/package-manager subcommands, and awk/sed scripts that can run commands or write files are all blocked. Quoted text is treated as data, so `grep "rm -rf" .` is allowed,
+- block other tools (for example MCP tools) whose annotations declare `readOnlyHint: false` or `destructiveHint: true`, unless they also declare `readOnlyHint: true`,
 - allow read/search/inspection commands,
 - allow checkpoint/output-selection/output-phase tools.
+
+The allowlist is a guardrail, not a sandbox; it errs on the side of blocking.
 
 When `outputPhase` is true, the assistant may use tools required for the approved output step. If an approved mutation is blocked by permissions, auth, or missing repo setup, it asks the user for permission, credentials, repo selection, or a revised plan instead of bypassing the gate, claiming success, or defaulting to drafts.
 
